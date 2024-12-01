@@ -55,6 +55,19 @@ const char* PREF_NAMESPACE = "motor";
 
 //**************************** ЛЕНТА ****************************
 
+// Переменные для фильтрации потенциометра ленты
+const int numPotReadings = 25; // Количество показаний для усреднения
+int potReadings[numPotReadings]; // Массив для хранения показаний
+int potReadIndex = 0; // Текущий индекс массива
+long potTotal = 0; // Сумма показаний
+int potAverage = 0; // Усредненное значение
+
+// Гистерезис на включение лены
+bool isStripOn = false; // Флаг состояния ленты
+const int hysteresisValue = 50; // Значение гистерезиса (настройте по необходимости)
+const int thresholdOn = THRESHOLD + hysteresisValue; // Порог включения
+const int thresholdOff = THRESHOLD - hysteresisValue; // Порог выключения
+
 // Переменные для эффектов
 uint8_t currentEffect = 2;
 const uint8_t numEffects = 4; // Количество доступных эффектов
@@ -184,6 +197,12 @@ void setup() {
   digitalWrite(TOGGLE_PIN, LOW);
   toggleState = LOW;
 
+   // Инициализация массива показаний потенциометра
+  for (int i = 0; i < numPotReadings; i++) {
+    potReadings[i] = analogRead(POT_PIN);
+    potTotal += potReadings[i];
+  }
+  potAverage = potTotal / numPotReadings;
 
   // Инициализация EEPROM Preferences
   preferences.begin(PREF_NAMESPACE, false);
@@ -456,12 +475,19 @@ void loop() {
   // Обновляем lastButtonState
   lastButtonState = reading;
 
+  // Чтение значения потенциометра и обновление скользящего среднего
+  potTotal = potTotal - potReadings[potReadIndex]; // Вычитаем старое значение из суммы
+  potReadings[potReadIndex] = analogRead(POT_PIN); // Читаем новое значение
+  potTotal = potTotal + potReadings[potReadIndex]; // Добавляем новое значение к сумме
+  potReadIndex = (potReadIndex + 1) % numPotReadings; // Переходим к следующему индексу
+
+  potAverage = potTotal / numPotReadings; // Вычисляем среднее
+
+  int potValue = potAverage; // Используем potAverage вместо potValue
+
   // === Обработка режима изменения цвета ===
   if (isColorChangeMode) {
-    // Чтение значения потенциометра (0 - 4095 для ESP32)
-    int potValue = analogRead(POT_PIN);
     uint8_t hueValue = map(potValue, 0, 4095, 0, 255); // Маппинг значения потенциометра на оттенок
-    //Serial.println("Обработка режима изменения цвета");
 
     // Устанавливаем цвет всей ленты
     fill_solid(leds, NUM_LEDS, CHSV(hueValue, 255, maxBrightness));
@@ -471,27 +497,30 @@ void loop() {
     userSelectedHue = hueValue;
   } else {
     // === Обработка потенциометра и яркости ===
-    // Чтение значения потенциометра (0 - 4095 для ESP32)
-    int potValue = analogRead(POT_PIN);
-    //Serial.print("Значение потенциометра: ");
-    //Serial.println(potValue);
 
-    // Калибровка потенциометра: минимальное положение
-    if (potValue < THRESHOLD) {
-      // Если потенциометр в минимальном положении, выключаем ленту
-      digitalWrite(TRANSISTOR_PIN, LOW);
-      //Serial.println("Лента выключена (потенциометр в минимальном положении)");
-      FastLED.clear();
-      FastLED.show();
-      return; // Выходим из цикла, чтобы не выполнять дальнейшую обработку
+    // Добавляем гистерезис
+    if (isStripOn) {
+      // Лента включена, проверяем, не нужно ли ее выключить
+      if (potValue < thresholdOff) {
+        isStripOn = false;
+        digitalWrite(TRANSISTOR_PIN, LOW);
+        FastLED.clear();
+        FastLED.show();
+        return; // Выходим из функции loop()
+      }
+    } else {
+      // Лента выключена, проверяем, не нужно ли ее включить
+      if (potValue > thresholdOn) {
+        isStripOn = true;
+        digitalWrite(TRANSISTOR_PIN, HIGH);
+      } else {
+        // Лента остается выключенной
+        return; // Выходим из функции loop()
+      }
     }
 
-    // Иначе включаем ленту
-    digitalWrite(TRANSISTOR_PIN, HIGH);
-    //Serial.println("Лента включена");
-
     // Карта значения потенциометра на уровень яркости (0 - 255)
-    uint8_t brightness = map(potValue, THRESHOLD, 4095, 0, 255);
+    uint8_t brightness = map(potValue, thresholdOn, 4095, 0, 255);
     brightness = constrain(brightness, 0, 255);
 
     // Обновляем максимальную яркость
