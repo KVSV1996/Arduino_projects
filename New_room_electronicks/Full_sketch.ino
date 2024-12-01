@@ -56,7 +56,7 @@ const char* PREF_NAMESPACE = "motor";
 //**************************** ЛЕНТА ****************************
 
 // Переменные для фильтрации потенциометра ленты
-const int numPotReadings = 25; // Количество показаний для усреднения
+const int numPotReadings = 40; // Количество показаний для усреднения
 int potReadings[numPotReadings]; // Массив для хранения показаний
 int potReadIndex = 0; // Текущий индекс массива
 long potTotal = 0; // Сумма показаний
@@ -107,10 +107,23 @@ uint8_t breatheHue = 0;
 // Эффект радуги
 uint8_t hue = 0;
 unsigned long lastRainbowUpdate = 0;
-unsigned long rainbowInterval = 50; // Интервал обновления радуги (мс)
+unsigned long rainbowInterval = 15; // Интервал обновления радуги (мс)
 
 // Переменная для хранения максимальной яркости
 uint8_t maxBrightness = 255;
+
+// Настройка яркости с вебы
+enum BrightnessControlSource {
+  BRIGHTNESS_CONTROL_POT,
+  BRIGHTNESS_CONTROL_WEB
+};
+
+BrightnessControlSource brightnessControlSource = BRIGHTNESS_CONTROL_POT; // По умолчанию управление с потенциометра
+
+int lastPotValue = 0; // Последнее значение потенциометра
+const int potChangeThreshold = 500; // Порог изменения потенциометра для переключения управления
+
+uint8_t webBrightness = 255; // Значение яркости, установленное через веб
 
 // Параметры Wi-Fi
 const char* ssid = "Crystal V3";         // Замените на ваш SSID
@@ -177,6 +190,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/setEffect", handleSetEffect);
   server.on("/setHue", handleSetHue);
+  server.on("/setBrightness", handleSetBrightness);  
   server.begin();
   Serial.println("Веб-сервер запущен.");
 
@@ -485,6 +499,14 @@ void loop() {
 
   int potValue = potAverage; // Используем potAverage вместо potValue
 
+  if (abs(potValue - lastPotValue) > potChangeThreshold) {
+  brightnessControlSource = BRIGHTNESS_CONTROL_POT;
+  lastPotValue = potValue;
+  //Serial.print("Переход управления на потенциометр, range:");
+  //Serial.println(potValue);
+  //Serial.println(lastPotValue);
+  }
+
   // === Обработка режима изменения цвета ===
   if (isColorChangeMode) {
     uint8_t hueValue = map(potValue, 0, 4095, 0, 255); // Маппинг значения потенциометра на оттенок
@@ -498,33 +520,59 @@ void loop() {
   } else {
     // === Обработка потенциометра и яркости ===
 
-    // Добавляем гистерезис
-    if (isStripOn) {
-      // Лента включена, проверяем, не нужно ли ее выключить
-      if (potValue < thresholdOff) {
-        isStripOn = false;
-        digitalWrite(TRANSISTOR_PIN, LOW);
-        FastLED.clear();
-        FastLED.show();
-        return; // Выходим из функции loop()
-      }
-    } else {
-      // Лента выключена, проверяем, не нужно ли ее включить
-      if (potValue > thresholdOn) {
-        isStripOn = true;
-        digitalWrite(TRANSISTOR_PIN, HIGH);
+    uint8_t brightness;
+    if (brightnessControlSource == BRIGHTNESS_CONTROL_POT) {
+      // Добавляем гистерезис
+      if (isStripOn) {
+        // Лента включена, проверяем, не нужно ли ее выключить
+        if (potValue < thresholdOff) {
+          isStripOn = false;
+          digitalWrite(TRANSISTOR_PIN, LOW);
+          FastLED.clear();
+          FastLED.show();
+          return; // Выходим из функции loop()
+        }
       } else {
-        // Лента остается выключенной
-        return; // Выходим из функции loop()
+        // Лента выключена, проверяем, не нужно ли ее включить
+        if (potValue > thresholdOn) {
+          isStripOn = true;
+          digitalWrite(TRANSISTOR_PIN, HIGH);
+        } else {
+          // Лента остается выключенной
+          return; // Выходим из функции loop()
+        }
       }
+
+      // Карта значения потенциометра на уровень яркости (0 - 255)
+      brightness = map(potValue, thresholdOn, 4095, 0, 255);
+      brightness = constrain(brightness, 0, 255);
+
+      // Обновляем максимальную яркость
+      maxBrightness = brightness;
+
+    } else if (brightnessControlSource == BRIGHTNESS_CONTROL_WEB) {
+      // Управление яркостью через веб
+      brightness = webBrightness;
+
+      // Управление включением/выключением ленты через веб (если необходимо)
+      if (brightness == 0) {
+        if (isStripOn) {
+          isStripOn = false;
+          digitalWrite(TRANSISTOR_PIN, LOW);
+          FastLED.clear();
+          FastLED.show();
+          return;
+        }
+      } else {
+        if (!isStripOn) {
+          isStripOn = true;
+          digitalWrite(TRANSISTOR_PIN, HIGH);
+        }
+      }
+
+      // Обновляем максимальную яркость
+      maxBrightness = brightness;
     }
-
-    // Карта значения потенциометра на уровень яркости (0 - 255)
-    uint8_t brightness = map(potValue, thresholdOn, 4095, 0, 255);
-    brightness = constrain(brightness, 0, 255);
-
-    // Обновляем максимальную яркость
-    maxBrightness = brightness;
 
     // === Выполнение выбранного эффекта ===
     switch (currentEffect) {
@@ -558,7 +606,7 @@ void rainbowEffect() {
     lastRainbowUpdate = currentTime;
     hue++; // Инкрементируем оттенок
   }
-  fill_rainbow(leds, NUM_LEDS, hue, 7);
+  fill_rainbow(leds, NUM_LEDS, hue, 2);
   FastLED.setBrightness(maxBrightness); // Устанавливаем максимальную яркость
   FastLED.show();
 }
@@ -644,7 +692,14 @@ void handleRoot() {
   html += "<button class='button' onclick=\"location.href='/setEffect?effect=2'\">Белый свет</button>";
   html += "<button class='button' onclick=\"location.href='/setEffect?effect=3'\">Пользовательский цвет</button>";
   
-  // Добавляем ползунок для изменения userSelectedHue
+  // Ползунок для изменения яркости
+  html += "<h2>Яркость</h2>";
+  html += "<form action='/setBrightness' method='GET'>";
+  html += "<input type='range' min='0' max='255' value='" + String(webBrightness) + "' class='slider' name='brightness' onchange='this.form.submit()'>";
+  html += "<p>Текущая яркость: " + String(webBrightness) + "</p>";
+  html += "</form>";
+
+  // Ползунок для изменения userSelectedHue
   html += "<h2>Изменение оттенка цвета</h2>";
   html += "<form action='/setHue' method='GET'>";
   html += "<input type='range' min='0' max='255' value='" + String(userSelectedHue) + "' class='slider' name='hue' onchange='this.form.submit()'>";
@@ -668,6 +723,25 @@ void handleSetEffect() {
     Serial.println(currentEffect);
   }
   server.sendHeader("Location", "/"); // Перенаправляем на главную страницу
+  server.send(303);
+}
+
+void handleSetBrightness() {
+  if (server.hasArg("brightness")) {
+    int newBrightness = server.arg("brightness").toInt();
+    // Ограничиваем значение от 0 до 255
+    if (newBrightness < 0) newBrightness = 0;
+    if (newBrightness > 255) newBrightness = 255;
+    webBrightness = newBrightness;
+    Serial.print("Яркость установлена через веб на: ");
+    Serial.println(webBrightness);
+
+    // Переключаемся на управление с веба
+    brightnessControlSource = BRIGHTNESS_CONTROL_WEB;
+  }
+  
+  // Перенаправляем обратно на главную страницу
+  server.sendHeader("Location", "/");
   server.send(303);
 }
 
