@@ -54,6 +54,15 @@ unsigned long lastDebounceTime = 0; // Время последнего изме�
 Preferences preferences;
 const char* PREF_NAMESPACE = "motor";
 
+enum StepperControlSource { 
+  STEPPER_CONTROL_POT,
+  STEPPER_CONTROL_WEB
+};
+
+volatile StepperControlSource stepperControlSource = STEPPER_CONTROL_POT; // Текущий режим управления
+
+volatile int webZone = 1; // Текущая зона, заданная через веб
+
 //**************************** ЛЕНТА ****************************
 
 // Переменные для фильтрации потенциометра ленты
@@ -203,6 +212,7 @@ void lightButton(){
 // Создание экземпляра веб-сервера
 WebServer server(80);
 
+unsigned long previousAttemptTime = 0;
 unsigned long startAttemptTime = millis();
 const unsigned long connectionTimeout = 10000; 
 
@@ -226,7 +236,8 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/setEffect", handleSetEffect);
   server.on("/setHue", handleSetHue);
-  server.on("/setBrightness", handleSetBrightness);  
+  server.on("/setBrightness", handleSetBrightness);
+  server.on("/controlZone", handleControlZone);  
   server.begin();
   Serial.println("Веб-сервер запущен.");
 
@@ -286,15 +297,16 @@ void setup() {
 void stepperTask(void *pvParameters) {
   const int threshold1 = POT_MAX / 3;
   const int threshold2 = 2 * POT_MAX / 3;
-  const int hysteresis = 50; // Настройте значение по необходимости
+  const int hysteresis = 120; // Настройте значение по необходимости
 
   int lastZone = -1; // Хранит предыдущую зону
+  int lastPotZone = -1;
 
   while (true) {
     int potValue = analogRead(POT_PIN_2);
 
     // Добавляем фильтрацию показаний потенциометра (скользящее среднее)
-    const int numReadings = 10;
+    const int numReadings = 20;
     static int readings[numReadings] = {0};
     static int readIndex = 0;
     static long total = 0;
@@ -308,51 +320,61 @@ void stepperTask(void *pvParameters) {
 
     potValue = average;
 
-    int zone;
-
-    // Определяем зону с учетом гистерезиса
+    int potZone;
     if (lastZone == 0) {
       if (potValue < threshold1 + hysteresis) {
-        zone = 0;
+        potZone = 0;
       } else if (potValue >= threshold1 + hysteresis && potValue < threshold2 - hysteresis) {
-        zone = 1;
+        potZone = 1;
       } else {
-        zone = 2;
+        potZone = 2;
       }
     } else if (lastZone == 1) {
       if (potValue < threshold1 - hysteresis) {
-        zone = 0;
+        potZone = 0;
       } else if (potValue >= threshold1 - hysteresis && potValue < threshold2 + hysteresis) {
-        zone = 1;
+        potZone = 1;
       } else {
-        zone = 2;
+        potZone = 2;
       }
     } else if (lastZone == 2) {
       if (potValue < threshold1 - hysteresis) {
-        zone = 0;
+        potZone = 0;
       } else if (potValue >= threshold1 - hysteresis && potValue < threshold2 - hysteresis) {
-        zone = 1;
+        potZone = 1;
       } else {
-        zone = 2;
+        potZone = 2;
       }
     } else {
-      // Если lastZone не определена, определяем зону без гистерезиса
       if (potValue < threshold1) {
-        zone = 0;
+        potZone = 0;
       } else if (potValue < threshold2) {
-        zone = 1;
+        potZone = 1;
       } else {
-        zone = 2;
+        potZone = 2;
       }
     }
 
+    // Переключение на потенциометр при изменении зоны
+    if (stepperControlSource == STEPPER_CONTROL_WEB && potZone != lastPotZone) {
+      stepperControlSource = STEPPER_CONTROL_POT;
+      Serial.println("Переключение на управление через потенциометр");
+      Serial.println(potZone);
+      Serial.println(webZone);
+    }
+
+    int zone;
+    if (stepperControlSource == STEPPER_CONTROL_POT) {
+      zone = potZone;
+      lastPotZone = potZone;
+    } else if (stepperControlSource == STEPPER_CONTROL_WEB) {
+      zone = webZone;
+    }      
+
     if (currentPosition == 7999 && zone == 0) {
-      extraForwardSteps = 100; 
-      Serial.println("Движение вперед с +100 шагов (т.к. позиция = 8000)");
-      } else {
-      extraForwardSteps = 0;
-      //Serial.println("Движение вперед без дополнительных шагов");
-      }
+      extraForwardSteps = 30; 
+      Serial.println("Движение вперед с +50 шагов (т.к. позиция = 8000)");
+    } 
 
     // Если зона изменилась, обновляем lastZone и выполняем действия
     if (zone != lastZone) {
@@ -416,7 +438,7 @@ void stepperTask(void *pvParameters) {
             (!direction && extraForwardSteps > 0)) {         
           stepMotor(); // Обычный шаг          
           extraForwardSteps--; 
-          
+          //Serial.println("Екстра шаг");
         }else {
           enableMotor(false); // Отключить двигатель
           preferences.putLong("position", currentPosition); // Сохранить позицию
@@ -432,9 +454,14 @@ void stepperTask(void *pvParameters) {
 
 void loop() {
 
-  if (WiFi.status() != WL_CONNECTED){
-    WiFi.begin(ssid, password);
-  }
+  if (WiFi.status() != WL_CONNECTED) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - previousAttemptTime >= connectionTimeout) {
+      previousAttemptTime = currentMillis;
+      Serial.println("Попытка подключения к Wi-Fi...");
+      WiFi.begin(ssid, password);
+    }
+  } 
   // Обработка клиентов веб-сервера
   server.handleClient();
 
@@ -531,10 +558,7 @@ void loop() {
 
   if (abs(potValue - lastPotValue) > potChangeThreshold) {
   brightnessControlSource = BRIGHTNESS_CONTROL_POT;
-  lastPotValue = potValue;
-  //Serial.print("Переход управления на потенциометр, range:");
-  //Serial.println(potValue);
-  //Serial.println(lastPotValue);
+  lastPotValue = potValue;  
   }
 
   // === Обработка режима изменения цвета ===
@@ -735,6 +759,14 @@ void handleRoot() {
   html += "<input type='range' min='0' max='255' value='" + String(userSelectedHue) + "' class='slider' name='hue' onchange='this.form.submit()'>";
   html += "<p>Текущий оттенок: " + String(userSelectedHue) + "</p>";
   html += "</form>";
+
+   // Добавление секции управления зоной
+  html += "<div class='control-section'>";
+  html += "<h2>Управление жалюзами</h2>";
+  html += "<button class='button' onclick=\"location.href='/controlZone?zone=2'\">Вниз</button>";
+  html += "<button class='button' onclick=\"location.href='/controlZone?zone=1'\">Остановить</button>";  
+  html += "<button class='button' onclick=\"location.href='/controlZone?zone=0'\">Вверх</button>";
+  html += "</div>";
   
   html += "</body></html>";
   
@@ -773,6 +805,23 @@ void handleSetBrightness() {
   // Перенаправляем обратно на главную страницу
   server.sendHeader("Location", "/");
   server.send(303);
+}
+
+void handleControlZone() {
+  if (server.hasArg("zone")) {
+    int zone = server.arg("zone").toInt();
+    if (zone >= 0 && zone <= 2) {
+      stepperControlSource = STEPPER_CONTROL_WEB; // Устанавливаем управление через веб
+      webZone = zone;      // Устанавливаем выбранную зону
+      Serial.printf("Зона изменена на %d, управление переключено на веб\n", zone);
+
+      // Перенаправляем обратно на главную страницу
+      server.sendHeader("Location", "/");
+      server.send(303);
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Неверный параметр зоны");
 }
 
 void handleSetHue() {
